@@ -1,0 +1,292 @@
+"""
+JARVIS Complete — Windows-friendly starter assistant
+Features: Tkinter GUI, AI chat (optional OpenAI API), push-to-talk speech input,
+text-to-speech, safe website opening, web searches, and allowlisted Windows app launches.
+
+Security:
+- API key is read from OPENAI_API_KEY environment variable; never hardcode it.
+- Destructive/system commands are intentionally not supported.
+- Microphone is accessed only when you press the Listen button.
+"""
+
+import os
+import platform
+import queue
+import subprocess
+import threading
+import urllib.parse
+import webbrowser
+import tkinter as tk
+from tkinter import ttk, messagebox
+from datetime import datetime
+
+try:
+    import pyttsx3
+except ImportError:
+    pyttsx3 = None
+
+try:
+    import speech_recognition as sr
+except ImportError:
+    sr = None
+
+try:
+    from openai import OpenAI
+except ImportError:
+    OpenAI = None
+
+APP_NAME = "JARVIS"
+MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
+SYSTEM_PROMPT = (
+    "You are JARVIS, a helpful desktop assistant. Be clear, friendly, and concise. "
+    "You cannot see the user's computer or perform actions unless the app explicitly offers them. "
+    "Never claim an action succeeded unless the app reports it."
+)
+
+class JarvisApp:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("J.A.R.V.I.S. — Desktop Assistant")
+        self.root.geometry("900x650")
+        self.root.minsize(700, 520)
+        self.root.configure(bg="#07111d")
+        self.messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+        self.ui_queue = queue.Queue()
+        self.speech_engine = None
+        self.client = None
+        self.busy = False
+
+        if pyttsx3:
+            try:
+                self.speech_engine = pyttsx3.init()
+                self.speech_engine.setProperty("rate", 180)
+                self.speech_engine.setProperty("volume", 0.9)
+            except Exception:
+                self.speech_engine = None
+
+        self._build_ui()
+        self._init_ai()
+        self.root.after(100, self._process_queue)
+        self._append("JARVIS", "Online. Type a message, use Listen for voice input, or try commands such as “open YouTube”, “time”, or “search for Blender tutorials”.")
+        self._append("SYSTEM", self._status_text())
+
+    def _build_ui(self):
+        top = tk.Frame(self.root, bg="#0b1c2b", padx=18, pady=14)
+        top.pack(fill="x")
+        tk.Label(top, text="J.A.R.V.I.S.", fg="#6fe7ff", bg="#0b1c2b",
+                 font=("Segoe UI", 23, "bold")).pack(side="left")
+        self.status = tk.Label(top, text="INITIALISING", fg="#ffd166", bg="#0b1c2b",
+                               font=("Consolas", 10, "bold"))
+        self.status.pack(side="right")
+
+        self.chat = tk.Text(self.root, bg="#081522", fg="#e8f1f8", insertbackground="white",
+                            font=("Consolas", 11), wrap="word", padx=14, pady=12,
+                            relief="flat", state="disabled")
+        self.chat.pack(fill="both", expand=True, padx=14, pady=(14, 8))
+        self.chat.tag_configure("user", foreground="#8bd3ff", spacing1=8)
+        self.chat.tag_configure("jarvis", foreground="#8ff0c5", spacing1=8)
+        self.chat.tag_configure("system", foreground="#ffcf70", spacing1=8)
+
+        bar = tk.Frame(self.root, bg="#07111d", padx=14, pady=8)
+        bar.pack(fill="x")
+        self.entry = ttk.Entry(bar, font=("Segoe UI", 11))
+        self.entry.pack(side="left", fill="x", expand=True, ipady=7)
+        self.entry.bind("<Return>", lambda _event: self.send_message())
+        ttk.Button(bar, text="Send", command=self.send_message).pack(side="left", padx=(8, 0))
+        ttk.Button(bar, text="🎙 Listen", command=self.listen).pack(side="left", padx=(8, 0))
+        ttk.Button(bar, text="Speak last", command=self.speak_last).pack(side="left", padx=(8, 0))
+        ttk.Button(bar, text="Clear", command=self.clear_chat).pack(side="left", padx=(8, 0))
+
+        bottom = tk.Frame(self.root, bg="#0b1c2b", padx=14, pady=8)
+        bottom.pack(fill="x")
+        tk.Label(bottom, text="Try: open YouTube • open Notepad • time • search for Python tutorials",
+                 fg="#91a6b8", bg="#0b1c2b", font=("Segoe UI", 9)).pack(side="left")
+        self.root.protocol("WM_DELETE_WINDOW", self.close)
+
+    def _init_ai(self):
+        key = os.getenv("OPENAI_API_KEY", "").strip()
+        if OpenAI and key:
+            try:
+                self.client = OpenAI(api_key=key)
+                self.status.config(text=f"AI READY · {MODEL}", fg="#8ff0c5")
+            except Exception as exc:
+                self.status.config(text="AI INIT ERROR", fg="#ff7b7b")
+                self._append("SYSTEM", f"Could not initialise AI client: {exc}")
+        else:
+            self.status.config(text="LOCAL MODE · NO API KEY", fg="#ffd166")
+
+    def _status_text(self):
+        if self.client:
+            return f"AI connected using {MODEL}. Website/app commands run locally from the allowlist."
+        return "AI is offline. Local commands still work. Set OPENAI_API_KEY to enable AI chat."
+
+    def _append(self, who, text):
+        self.chat.configure(state="normal")
+        tag = {"YOU": "user", "JARVIS": "jarvis"}.get(who, "system")
+        self.chat.insert("end", f"{who}: {text}\n\n", tag)
+        self.chat.see("end")
+        self.chat.configure(state="disabled")
+
+    def _process_queue(self):
+        try:
+            while True:
+                action, payload = self.ui_queue.get_nowait()
+                if action == "append":
+                    self._append(*payload)
+                elif action == "status":
+                    self.status.config(text=payload[0], fg=payload[1])
+                elif action == "busy":
+                    self.busy = payload
+            self.root.after(100, self._process_queue)
+        except queue.Empty:
+            self.root.after(100, self._process_queue)
+
+    def send_message(self):
+        text = self.entry.get().strip()
+        if not text or self.busy:
+            return
+        self.entry.delete(0, "end")
+        self._append("YOU", text)
+        self.messages.append({"role": "user", "content": text})
+        self.ui_queue.put(("busy", True))
+        self.ui_queue.put(("status", ("THINKING…", "#ffd166")))
+        threading.Thread(target=self._handle_message, args=(text,), daemon=True).start()
+
+    def _handle_message(self, text):
+        try:
+            local_response = self._run_local_command(text)
+            if local_response is not None:
+                self.ui_queue.put(("append", ("JARVIS", local_response)))
+                return
+            if self.client:
+                # Keep context bounded to avoid unbounded token use.
+                response = self.client.responses.create(
+                    model=MODEL,
+                    input=self.messages[-16:],
+                )
+                answer = response.output_text.strip() or "I couldn't produce a response."
+                self.messages.append({"role": "assistant", "content": answer})
+                self.ui_queue.put(("append", ("JARVIS", answer)))
+            else:
+                self.ui_queue.put(("append", ("JARVIS", "I can handle local commands, but AI chat is not configured. Set OPENAI_API_KEY securely and restart to enable AI conversations.")))
+        except Exception as exc:
+            self.ui_queue.put(("append", ("SYSTEM", f"Error: {exc}")))
+        finally:
+            self.ui_queue.put(("busy", False))
+            self.ui_queue.put(("status", (f"AI READY · {MODEL}" if self.client else "LOCAL MODE · NO API KEY",
+                                          "#8ff0c5" if self.client else "#ffd166")))
+
+    def _run_local_command(self, raw):
+        text = raw.strip().lower()
+        if text in {"time", "what time is it", "tell me the time"}:
+            return "The time is " + datetime.now().strftime("%I:%M %p") + "."
+        if text in {"date", "what is the date", "today's date"}:
+            return "Today is " + datetime.now().strftime("%A, %d %B %Y") + "."
+        if text in {"help", "commands"}:
+            return "Commands: time, date, open YouTube/Google/GitHub/ChatGPT/Lovable, search for <query>, open Notepad/Calculator/File Explorer, help."
+        websites = {
+            "youtube": "https://www.youtube.com",
+            "google": "https://www.google.com",
+            "github": "https://github.com",
+            "chatgpt": "https://chatgpt.com",
+            "lovable": "https://lovable.dev",
+            "gmail": "https://mail.google.com",
+        }
+        if text.startswith("open "):
+            target = text[5:].strip()
+            if target in websites:
+                webbrowser.open(websites[target])
+                return f"Opened {target} in your default browser."
+            if target in {"notepad", "calculator", "file explorer"}:
+                if platform.system() != "Windows":
+                    return "This desktop-app shortcut is configured for Windows only."
+                commands = {
+                    "notepad": ["notepad.exe"],
+                    "calculator": ["calc.exe"],
+                    "file explorer": ["explorer.exe"],
+                }
+                try:
+                    subprocess.Popen(commands[target])
+                    return f"Launched {target}."
+                except Exception as exc:
+                    return f"Could not launch {target}: {exc}"
+            return "That target isn't in the safe launch allowlist. Try a website or app listed in Help."
+        if text.startswith("search for "):
+            query = raw.strip()[11:].strip()
+            if query:
+                webbrowser.open("https://www.google.com/search?q=" + urllib.parse.quote_plus(query))
+                return f"Opened search results for: {query}"
+            return "Tell me what you'd like to search for."
+        return None
+
+    def listen(self):
+        if not sr:
+            messagebox.showerror("Voice input unavailable", "Install SpeechRecognition and PyAudio first. You can still type commands.")
+            return
+        if self.busy:
+            return
+        self.status.config(text="LISTENING…", fg="#6fe7ff")
+        self.busy = True
+        threading.Thread(target=self._listen_worker, daemon=True).start()
+
+    def _listen_worker(self):
+        try:
+            recognizer = sr.Recognizer()
+            with sr.Microphone() as source:
+                recognizer.adjust_for_ambient_noise(source, duration=0.4)
+                audio = recognizer.listen(source, timeout=5, phrase_time_limit=10)
+            text = recognizer.recognize_google(audio)
+            self.ui_queue.put(("append", ("SYSTEM", f"Recognised: {text}")))
+            self.ui_queue.put(("busy", False))
+            self.ui_queue.put(("status", ("VOICE RECEIVED", "#8ff0c5")))
+            # Submit through Tk thread.
+            self.root.after(0, lambda t=text: self._submit_voice_text(t))
+        except Exception as exc:
+            self.ui_queue.put(("append", ("SYSTEM", f"Voice input failed: {exc}. You can type instead.")))
+            self.ui_queue.put(("busy", False))
+            self.ui_queue.put(("status", ("VOICE ERROR", "#ff7b7b")))
+
+    def _submit_voice_text(self, text):
+        self.entry.delete(0, "end")
+        self.entry.insert(0, text)
+        self.send_message()
+
+    def speak_last(self):
+        if not self.speech_engine:
+            messagebox.showinfo("Text-to-speech", "Install pyttsx3 to enable speech output.")
+            return
+        last = None
+        for msg in reversed(self.messages):
+            if msg.get("role") == "assistant":
+                last = msg.get("content")
+                break
+        if not last:
+            return
+        threading.Thread(target=self._speak_worker, args=(last,), daemon=True).start()
+
+    def _speak_worker(self, text):
+        try:
+            self.speech_engine.say(text[:2500])
+            self.speech_engine.runAndWait()
+        except Exception as exc:
+            self.ui_queue.put(("append", ("SYSTEM", f"Speech output error: {exc}")))
+
+    def clear_chat(self):
+        self.messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+        self.chat.configure(state="normal")
+        self.chat.delete("1.0", "end")
+        self.chat.configure(state="disabled")
+        self._append("SYSTEM", "Chat cleared. Local commands remain available.")
+
+    def close(self):
+        if messagebox.askyesno("Exit JARVIS", "Close JARVIS?"):
+            self.root.destroy()
+
+
+def main():
+    root = tk.Tk()
+    app = JarvisApp(root)
+    root.mainloop()
+
+if __name__ == "__main__":
+    main()
